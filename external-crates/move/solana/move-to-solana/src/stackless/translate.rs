@@ -147,11 +147,11 @@ impl<'up> GlobalContext<'up> {
         let Self { env, llvm_cx, .. } = self;
 
         let m_env = env.get_module(id);
-        let llvm_builder = llvm_cx.create_builder();
         let modname = m_env.llvm_module_name();
         debug!(target: "dwarf", "Create DWARF for module {:#?} with source {:#?}", modname, source);
-        let mut module = self.llvm_cx.create_module(&modname);
-        let llvm_di_builder = llvm_cx.create_di_builder(self, &mut module, source, options.debug);
+        // DIBuilder does not depend on Builder and can be created first
+        let llvm_di_builder = llvm_cx.create_di_builder(self, llmod, source, options.debug);
+        let llvm_builder = llvm_cx.create_builder();
         let rtty_cx = RttyContext::new(self.env, &self.llvm_cx, llmod);
         ModuleContext {
             env: self.env.get_module(id),
@@ -225,10 +225,7 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
         let map_node_to_type: BTreeMap<mm::NodeId, move_model::ty::Type> = g_env
             .get_nodes()
             .iter()
-            .map(|nd| {
-                debug!(target: "nodes", "{:#?} {:#?}", nd, g_env.get_node_loc(*nd));
-                (*nd, g_env.get_node_type(*nd))
-            })
+            .map(|nd| (*nd, g_env.get_node_type(*nd)))
             .collect();
         debug!(target: "nodes", "\n{:#?}", &map_node_to_type);
 
@@ -293,7 +290,6 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                     name = format!("local_{}__{}", i, s);
                 }
                 let llval = self.module_cx.llvm_builder.build_alloca(llty, &name);
-                debug!(target: "functions", "adding {i} local {}:\n {:#?}\n {:#?}\n {:#?}\n", &name, mty, llty, llval);
                 self.locals.push(Local {
                     mty: mty.instantiate(self.type_params),
                     llty,
@@ -348,14 +344,17 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
             }
         }
 
+        let di_func = self.module_cx.llvm_di_builder.create_function(&self, None);
+
         // Translate instructions
         for instr in &fn_data.code {
             self.translate_instruction(instr);
         }
 
-        ll_fn.verify();
-
-        self.module_cx.llvm_di_builder.create_function(&self, None);
+        self.module_cx
+            .llvm_di_builder
+            .finalize_function(&self, di_func);
+        ll_fn.verify(self.module_cx);
     }
 
     fn translate_instruction(&mut self, instr: &sbc::Bytecode) {
@@ -381,10 +380,11 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                         | mty::PrimitiveType::U256,
                     ) => {
                         let (load, store) = builder.load_store(llty, src_llval, dst_llval);
-                        builder_di.create_load_store(instr_dbg, load, store, mty);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     mty::Type::Reference(_, _) => {
-                        builder.load_store(llty, src_llval, dst_llval);
+                        let (load, store) = builder.load_store(llty, src_llval, dst_llval);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     mty::Type::Struct(_, _, _) => {
                         // A move renders the source location inaccessible, but the storage is
@@ -401,9 +401,11 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                         self.locals[*dst] = self.locals[*src].clone();
                     }
                     mty::Type::Vector(_) => {
-                        self.module_cx
+                        let (load, store) = self
+                            .module_cx
                             .llvm_builder
                             .load_store(llty, src_llval, dst_llval);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     _ => todo!("{mty:?}"),
                 }
@@ -423,13 +425,16 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                         | mty::PrimitiveType::U128
                         | mty::PrimitiveType::U256,
                     ) => {
-                        builder.load_store(llty, src_llval, dst_llval);
+                        let (load, store) = builder.load_store(llty, src_llval, dst_llval);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     mty::Type::Struct(_, _, _) => {
-                        builder.load_store(llty, src_llval, dst_llval);
+                        let (load, store) = builder.load_store(llty, src_llval, dst_llval);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     mty::Type::Primitive(mty::PrimitiveType::Address) => {
-                        builder.load_store(llty, src_llval, dst_llval);
+                        let (load, store) = builder.load_store(llty, src_llval, dst_llval);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     mty::Type::Vector(elt_mty) => {
                         self.module_cx.emit_rtcall_with_retval(RtCall::VecCopy(
@@ -440,10 +445,14 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                     }
                     mty::Type::Reference(_, referent) => match **referent {
                         mty::Type::Struct(_, _, _) => {
-                            builder.load_store(llty, src_llval, dst_llval);
+                            let (load, store) = builder.load_store(llty, src_llval, dst_llval);
+                            instr_dbg
+                                .create_load_store(load, store, mty, llty, src_llval, dst_llval);
                         }
                         _ => {
-                            builder.load_store(llty, src_llval, dst_llval);
+                            let (load, store) = builder.load_store(llty, src_llval, dst_llval);
+                            instr_dbg
+                                .create_load_store(load, store, mty, llty, src_llval, dst_llval);
                         }
                     },
                     _ => todo!("{mty:?}"),
@@ -466,24 +475,29 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                         | mty::PrimitiveType::Address
                         | mty::PrimitiveType::Signer,
                     ) => {
-                        builder.load_store(llty, src_llval, dst_llval);
+                        let (load, store) = builder.load_store(llty, src_llval, dst_llval);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     mty::Type::Reference(_, _) => {
-                        builder.load_store(llty, src_llval, dst_llval);
+                        let (load, store) = builder.load_store(llty, src_llval, dst_llval);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     mty::Type::Struct(_, _, _) => {
-                        builder.load_store(llty, src_llval, dst_llval);
+                        let (load, store) = builder.load_store(llty, src_llval, dst_llval);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     mty::Type::Vector(_) => {
-                        self.module_cx
+                        let (load, store) = self
+                            .module_cx
                             .llvm_builder
                             .load_store(llty, src_llval, dst_llval);
+                        instr_dbg.create_load_store(load, store, mty, llty, src_llval, dst_llval);
                     }
                     _ => todo!("{mty:#?}"),
                 }
             }
             sbc::Bytecode::Call(_, dst, op, src, None) => {
-                self.translate_call(dst, op, src);
+                self.translate_call(dst, op, src, instr, instr_dbg);
             }
             sbc::Bytecode::Ret(_, vals) => match vals.len() {
                 0 => {
@@ -530,7 +544,7 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                 builder.position_at_end(llbb);
             }
             sbc::Bytecode::Abort(_, local) => {
-                self.emit_rtcall(RtCall::Abort(*local));
+                self.emit_rtcall(RtCall::Abort(*local), instr);
             }
             sbc::Bytecode::Nop(_) => {}
             _ => {
@@ -1164,6 +1178,8 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
         dst: &[mast::TempIndex],
         op: &sbc::Operation,
         src: &[mast::TempIndex],
+        instr: &sbc::Bytecode,
+        instr_dbg: super::dwarf::PublicInstruction<'_>,
     ) {
         use sbc::Operation;
         let emitter_nop: CheckEmitterFn = (|_, _| (), EmitterFnKind::PreCheck);
@@ -1175,7 +1191,7 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                 let fn_name = &self.env.get_name_str();
                 debug!(target: "dwarf", "translate_call function {fn_name} op {:#?} dst {:#?} src {:#?} types {:#?}",
                     op, dst, src, &types);
-                self.translate_fun_call(*mod_id, *fun_id, &types, dst, src);
+                self.translate_fun_call(*mod_id, *fun_id, &types, dst, src, instr, instr_dbg);
             }
             Operation::BorrowLoc => {
                 assert_eq!(src.len(), 1);
@@ -1283,7 +1299,7 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                     mty::Type::Struct(_, _, _) => ( /* nop */ ),
                     mty::Type::Reference(_, _) => { /* nop */ }
                     mty::Type::Vector(elt_mty) => {
-                        self.emit_rtcall(RtCall::VecDestroy(idx, (**elt_mty).clone()));
+                        self.emit_rtcall(RtCall::VecDestroy(idx, (**elt_mty).clone()), instr);
                     }
                     _ => todo!("{mty:?}"),
                 }
@@ -1521,6 +1537,7 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
         types: &[mty::Type],
         dst: &[mast::TempIndex],
         src: &[mast::TempIndex],
+        _instr: &sbc::Bytecode,
     ) {
         let types = mty::Type::instantiate_vec(types.to_vec(), self.type_params);
         let typarams = self.module_cx.get_rttydesc_ptrs(&types);
@@ -1594,6 +1611,8 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
         types: &[mty::Type],
         dst: &[mast::TempIndex],
         src: &[mast::TempIndex],
+        instr: &sbc::Bytecode,
+        instr_dbg: super::dwarf::PublicInstruction<'_>,
     ) {
         // Handle native function calls specially.
         {
@@ -1601,7 +1620,7 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
             let fn_id = fun_id.qualified(mod_id);
             let fn_env = global_env.get_function(fn_id);
             if fn_env.is_native() {
-                return self.translate_native_fun_call(mod_id, fun_id, types, dst, src);
+                return self.translate_native_fun_call(mod_id, fun_id, types, dst, src, instr);
             }
         }
 
@@ -1653,7 +1672,7 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
 
         self.module_cx
             .llvm_builder
-            .load_call_store(ll_fn, &src, &dst);
+            .load_call_store(ll_fn, &src, &dst, instr_dbg);
     }
 
     // Optional vec_mty is only used for a vector literal (i.e., Constant<Vector(Vec<Constant>))
@@ -1863,7 +1882,7 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
         (res_val.llvm_type(), res_ptr)
     }
 
-    fn emit_rtcall(&self, rtcall: RtCall) {
+    fn emit_rtcall(&self, rtcall: RtCall, _instr: &sbc::Bytecode) {
         match &rtcall {
             RtCall::Abort(local_idx) => {
                 let llfn = ModuleContext::get_runtime_function(
@@ -1878,6 +1897,7 @@ impl<'mm, 'up> FunctionContext<'mm, 'up> {
                     llfn,
                     &[(local_llty, local_llval)],
                     &[],
+                    super::dwarf::PublicInstruction::none(),
                 );
                 self.module_cx.llvm_builder.build_unreachable();
             }
