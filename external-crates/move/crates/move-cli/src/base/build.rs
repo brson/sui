@@ -3,7 +3,7 @@
 
 use super::reroot_path;
 use clap::*;
-use move_package::BuildConfig;
+use move_package::{Architecture, BuildConfig};
 use std::path::PathBuf;
 
 /// Build the package at `path`. If no path is provided defaults to current directory.
@@ -22,8 +22,20 @@ impl Build {
             config.download_deps_for_package(&rerooted_path, &mut std::io::stdout())?;
             return Ok(());
         }
+        let architecture = config.architecture.unwrap_or(Architecture::Sui);
 
-        config.compile_package(&rerooted_path, &mut std::io::stdout())?;
+        match architecture {
+            Architecture::Sui => {
+                config.compile_package(&rerooted_path, &mut std::io::stdout())?;
+            }
+            Architecture::Solana => {
+                #[cfg(feature = "solana-backend")]
+                config.compile_package_solana(&rerooted_path, &mut std::io::stderr())?;
+
+                #[cfg(not(feature = "solana-backend"))]
+                anyhow::bail!("The Solana architecture is not supported because move-cli was not compiled with feature flag `solana-backend`.");
+            }
+        }
         Ok(())
     }
 }
